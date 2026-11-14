@@ -1,0 +1,1184 @@
+#include <Wire.h>
+#include <MIDIUSB.h>
+
+const byte MPU_ADDR = 0x68;
+
+const byte midiChannel = 0;
+
+const byte ccXPositive = 90;
+const byte ccXNegative = 91;
+const byte ccYPositive = 92;
+const byte ccYNegative = 93;
+const byte ccZPositive = 94;
+const byte ccZNegative = 95;
+const byte ccMotion    = 96;
+const byte ccFlex      = 97;
+
+const byte flex1Pin = A0;
+const byte flex2Pin = A1;
+
+const byte powerButtonPin = 7;
+
+float flex1Straight = 285.0;
+float flex1Bent     = 264.0;
+
+float flex2Straight = 318.0;
+float flex2Bent     = 302.0;
+
+const int FLEX_SAMPLE_COUNT = 20;
+const float FLEX_FILTER_ALPHA = 0.20;
+const int FLEX_DEADBAND = 2;
+
+float filteredFlex1 = 0;
+float filteredFlex2 = 0;
+
+bool flexFilterInitialized = false;
+
+const unsigned long FLEX_CALIBRATION_TIME = 3000;
+
+bool gloveEnabled = false;
+
+bool rawButtonState = HIGH;
+bool stableButtonState = HIGH;
+
+unsigned long lastButtonChangeTime = 0;
+const unsigned long buttonDebounceTime = 50;
+
+const float maxTiltDegrees = 90.0;
+const float maxZAngleDegrees = 90.0;
+
+const float motionStartG = 0.05;
+const float motionMaxG = 1.00;
+const float motionReleaseSeconds = 1.5;
+
+float motionEnvelope = 0;
+
+float gyroOffsetX = 0;
+float gyroOffsetY = 0;
+float gyroOffsetZ = 0;
+
+float neutralAngleX = 0;
+float neutralAngleY = 0;
+
+float angleX = 0;
+float angleY = 0;
+float angleZ = 0;
+
+float gravityX = 0;
+float gravityY = 0;
+float gravityZ = 1;
+
+int previousCC90 = -1;
+int previousCC91 = -1;
+int previousCC92 = -1;
+int previousCC93 = -1;
+int previousCC94 = -1;
+int previousCC95 = -1;
+int previousCC96 = -1;
+int previousCC97 = -1;
+
+byte mappingOnlyCC = 0;
+
+unsigned long previousMicros = 0;
+unsigned long lastPrintTime = 0;
+unsigned long lastErrorPrint = 0;
+
+bool mpuReady = false;
+
+
+// ---------------- MIDI ----------------
+
+void sendCC(byte controller, byte value) {
+
+  midiEventPacket_t event = {
+    0x0B,
+    byte(0xB0 | midiChannel),
+    controller,
+    value
+  };
+
+  MidiUSB.sendMIDI(event);
+}
+
+
+void sendAllCCZero() {
+
+  sendCC(ccXPositive, 0);
+  sendCC(ccXNegative, 0);
+
+  sendCC(ccYPositive, 0);
+  sendCC(ccYNegative, 0);
+
+  sendCC(ccZPositive, 0);
+  sendCC(ccZNegative, 0);
+
+  sendCC(ccMotion, 0);
+  sendCC(ccFlex, 0);
+
+  MidiUSB.flush();
+}
+
+
+bool maySendCC(byte cc) {
+  return mappingOnlyCC == 0 || mappingOnlyCC == cc;
+}
+
+
+void sendCCIfAllowed(
+  byte controller,
+  int value,
+  int &previousValue
+) {
+
+  if (!maySendCC(controller)) {
+    return;
+  }
+
+  if (value != previousValue) {
+
+    sendCC(controller, value);
+
+    previousValue = value;
+  }
+}
+
+
+void resetPreviousCCValues() {
+
+  previousCC90 = -1;
+  previousCC91 = -1;
+  previousCC92 = -1;
+  previousCC93 = -1;
+  previousCC94 = -1;
+  previousCC95 = -1;
+  previousCC96 = -1;
+  previousCC97 = -1;
+}
+
+
+// ---------------- RESET ----------------
+
+void resetAllValues() {
+
+  Serial.println();
+  Serial.println("Reset...");
+
+  sendAllCCZero();
+
+  resetPreviousCCValues();
+
+  motionEnvelope = 0;
+
+  angleZ = 0;
+
+  flexFilterInitialized = false;
+
+  filteredFlex1 = analogRead(flex1Pin);
+  filteredFlex2 = analogRead(flex2Pin);
+
+  flexFilterInitialized = true;
+
+  if (mpuReady) {
+    calibrateMPU();
+  }
+
+  previousMicros = micros();
+
+  Serial.println("Reset klaar.");
+  Serial.println();
+}
+
+
+// ---------------- KNOP ----------------
+
+void updatePowerButton() {
+
+  bool currentReading = digitalRead(powerButtonPin);
+
+  if (currentReading != rawButtonState) {
+
+    lastButtonChangeTime = millis();
+
+    rawButtonState = currentReading;
+  }
+
+  if (millis() - lastButtonChangeTime >= buttonDebounceTime) {
+
+    if (stableButtonState != rawButtonState) {
+
+      stableButtonState = rawButtonState;
+
+      if (stableButtonState == LOW) {
+
+        gloveEnabled = !gloveEnabled;
+
+        if (gloveEnabled) {
+
+          resetPreviousCCValues();
+          previousMicros = micros();
+
+          Serial.println("Handschoen AAN.");
+
+        } else {
+
+          sendAllCCZero();
+
+          resetPreviousCCValues();
+
+          motionEnvelope = 0;
+
+          Serial.println("Handschoen UIT.");
+        }
+      }
+    }
+  }
+}
+
+
+// ---------------- SERIAL ----------------
+
+void handleSerialCommands() {
+
+  if (!Serial.available()) {
+    return;
+  }
+
+  String command = Serial.readStringUntil('\n');
+
+  command.trim();
+
+  command.toLowerCase();
+
+
+  if (command == "reset") {
+
+    resetAllValues();
+
+    return;
+  }
+
+
+  if (command == "c") {
+
+    calibrateFlex();
+
+    return;
+  }
+
+
+  byte newMappingCC = mappingOnlyCC;
+
+  bool recognized = true;
+
+
+  if (command == "1") {
+    newMappingCC = 90;
+  }
+
+  else if (command == "2") {
+    newMappingCC = 91;
+  }
+
+  else if (command == "3") {
+    newMappingCC = 92;
+  }
+
+  else if (command == "4") {
+    newMappingCC = 93;
+  }
+
+  else if (command == "5") {
+    newMappingCC = 94;
+  }
+
+  else if (command == "6") {
+    newMappingCC = 95;
+  }
+
+  else if (command == "7") {
+    newMappingCC = 96;
+  }
+
+  else if (command == "8") {
+    newMappingCC = 97;
+  }
+
+  else if (command == "0") {
+    newMappingCC = 0;
+  }
+
+  else {
+    recognized = false;
+  }
+
+
+  if (recognized) {
+
+    mappingOnlyCC = newMappingCC;
+
+    resetPreviousCCValues();
+
+    if (mappingOnlyCC == 0) {
+      Serial.println("Alle CC's actief.");
+    } else {
+      Serial.print("Alleen CC");
+      Serial.print(mappingOnlyCC);
+      Serial.println(" actief.");
+    }
+  }
+}
+
+
+// ---------------- MPU ----------------
+
+bool writeMPU(byte reg, byte value) {
+
+  Wire.beginTransmission(MPU_ADDR);
+
+  Wire.write(reg);
+  Wire.write(value);
+
+  return Wire.endTransmission() == 0;
+}
+
+
+bool readMPU(
+  int16_t &ax,
+  int16_t &ay,
+  int16_t &az,
+  int16_t &gx,
+  int16_t &gy,
+  int16_t &gz
+) {
+
+  Wire.beginTransmission(MPU_ADDR);
+
+  Wire.write(0x3B);
+
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  Wire.requestFrom(MPU_ADDR, (byte)14);
+
+  if (Wire.available() < 14) {
+    return false;
+  }
+
+  ax = (int16_t)((Wire.read() << 8) | Wire.read());
+  ay = (int16_t)((Wire.read() << 8) | Wire.read());
+  az = (int16_t)((Wire.read() << 8) | Wire.read());
+
+  Wire.read();
+  Wire.read();
+
+  gx = (int16_t)((Wire.read() << 8) | Wire.read());
+  gy = (int16_t)((Wire.read() << 8) | Wire.read());
+  gz = (int16_t)((Wire.read() << 8) | Wire.read());
+
+  return true;
+}
+
+
+int angleToMidi(float angle, float maximumAngle) {
+
+  int value =
+    (int)(angle * 127.0 / maximumAngle + 0.5);
+
+  return constrain(value, 0, 127);
+}
+
+
+int motionToMidi(float motionG) {
+
+  float value =
+    (motionG - motionStartG) *
+    127.0 /
+    (motionMaxG - motionStartG);
+
+  return constrain(
+    (int)(value + 0.5),
+    0,
+    127
+  );
+}
+
+
+// ---------------- FLEX ----------------
+
+int readFlexAverage(byte pin) {
+
+  long total = 0;
+
+  for (int i = 0; i < FLEX_SAMPLE_COUNT; i++) {
+
+    total += analogRead(pin);
+
+    delayMicroseconds(300);
+  }
+
+  return total / FLEX_SAMPLE_COUNT;
+}
+
+
+int flexToMidi(
+  float raw,
+  float straight,
+  float bent
+) {
+
+  if (straight == bent) {
+    return 0;
+  }
+
+  float value;
+
+  if (bent < straight) {
+
+    value =
+      (straight - raw) *
+      127.0 /
+      (straight - bent);
+
+  } else {
+
+    value =
+      (raw - straight) *
+      127.0 /
+      (bent - straight);
+  }
+
+  if (value <= FLEX_DEADBAND) {
+    value = 0;
+  }
+
+  return constrain(
+    (int)(value + 0.5),
+    0,
+    127
+  );
+}
+
+
+int updateFlexSensors(
+  int &raw1,
+  int &raw2,
+  int &midi1,
+  int &midi2
+) {
+
+  raw1 = readFlexAverage(flex1Pin);
+  raw2 = readFlexAverage(flex2Pin);
+
+
+  if (!flexFilterInitialized) {
+
+    filteredFlex1 = raw1;
+    filteredFlex2 = raw2;
+
+    flexFilterInitialized = true;
+
+  } else {
+
+    filteredFlex1 =
+      filteredFlex1 *
+      (1.0 - FLEX_FILTER_ALPHA) +
+      raw1 *
+      FLEX_FILTER_ALPHA;
+
+    filteredFlex2 =
+      filteredFlex2 *
+      (1.0 - FLEX_FILTER_ALPHA) +
+      raw2 *
+      FLEX_FILTER_ALPHA;
+  }
+
+
+  midi1 = flexToMidi(
+    filteredFlex1,
+    flex1Straight,
+    flex1Bent
+  );
+
+  midi2 = flexToMidi(
+    filteredFlex2,
+    flex2Straight,
+    flex2Bent
+  );
+
+
+  int combined =
+    (midi1 + midi2) / 2;
+
+
+  return constrain(combined, 0, 127);
+}
+
+
+// ---------------- FLEX KALIBRATIE ----------------
+
+void calibrateFlex() {
+
+  gloveEnabled = false;
+
+  Serial.println();
+  Serial.println("Flex kalibratie.");
+
+  Serial.println("Vingers recht.");
+
+  delay(1000);
+
+
+  unsigned long startTime = millis();
+
+  long total1 = 0;
+  long total2 = 0;
+
+  long samples = 0;
+
+
+  while (
+    millis() - startTime <
+    FLEX_CALIBRATION_TIME
+  ) {
+
+    total1 += analogRead(flex1Pin);
+    total2 += analogRead(flex2Pin);
+
+    samples++;
+
+    delay(10);
+  }
+
+
+  flex1Straight =
+    total1 / (float)samples;
+
+  flex2Straight =
+    total2 / (float)samples;
+
+
+  Serial.print("F1 straight = ");
+  Serial.println(flex1Straight, 1);
+
+  Serial.print("F2 straight = ");
+  Serial.println(flex2Straight, 1);
+
+
+  Serial.println("Vingers gebogen.");
+
+  delay(1000);
+
+
+  startTime = millis();
+
+  total1 = 0;
+  total2 = 0;
+
+  samples = 0;
+
+
+  while (
+    millis() - startTime <
+    FLEX_CALIBRATION_TIME
+  ) {
+
+    total1 += analogRead(flex1Pin);
+    total2 += analogRead(flex2Pin);
+
+    samples++;
+
+    delay(10);
+  }
+
+
+  flex1Bent =
+    total1 / (float)samples;
+
+  flex2Bent =
+    total2 / (float)samples;
+
+
+  Serial.print("F1 bent = ");
+  Serial.println(flex1Bent, 1);
+
+  Serial.print("F2 bent = ");
+  Serial.println(flex2Bent, 1);
+
+
+  flexFilterInitialized = false;
+
+  resetPreviousCCValues();
+
+  Serial.println("Flex kalibratie klaar.");
+}
+
+
+// ---------------- MPU KALIBRATIE ----------------
+
+void calibrateMPU() {
+
+  const int samples = 400;
+
+  long totalGX = 0;
+  long totalGY = 0;
+  long totalGZ = 0;
+
+  float totalAngleX = 0;
+  float totalAngleY = 0;
+
+  float totalAX = 0;
+  float totalAY = 0;
+  float totalAZ = 0;
+
+  int validSamples = 0;
+
+
+  Serial.println("MPU kalibratie...");
+  Serial.println("Houd stil.");
+
+
+  for (int i = 0; i < samples; i++) {
+
+    int16_t ax, ay, az;
+    int16_t gx, gy, gz;
+
+
+    if (readMPU(
+      ax, ay, az,
+      gx, gy, gz
+    )) {
+
+      float axG = ax / 16384.0;
+      float ayG = ay / 16384.0;
+      float azG = az / 16384.0;
+
+
+      totalGX += gx;
+      totalGY += gy;
+      totalGZ += gz;
+
+
+      totalAngleX +=
+        atan2(ayG, azG)
+        * 180.0 / PI;
+
+
+      totalAngleY +=
+        atan2(
+          -axG,
+          sqrt(
+            ayG * ayG +
+            azG * azG
+          )
+        )
+        * 180.0 / PI;
+
+
+      totalAX += axG;
+      totalAY += ayG;
+      totalAZ += azG;
+
+
+      validSamples++;
+    }
+
+
+    delay(2);
+  }
+
+
+  if (validSamples == 0) {
+
+    mpuReady = false;
+
+    Serial.println("MPU kalibratie mislukt.");
+
+    return;
+  }
+
+
+  gyroOffsetX =
+    totalGX / (float)validSamples;
+
+  gyroOffsetY =
+    totalGY / (float)validSamples;
+
+  gyroOffsetZ =
+    totalGZ / (float)validSamples;
+
+
+  neutralAngleX =
+    totalAngleX / validSamples;
+
+  neutralAngleY =
+    totalAngleY / validSamples;
+
+
+  angleX = neutralAngleX;
+  angleY = neutralAngleY;
+  angleZ = 0;
+
+
+  gravityX =
+    totalAX / validSamples;
+
+  gravityY =
+    totalAY / validSamples;
+
+  gravityZ =
+    totalAZ / validSamples;
+
+
+  motionEnvelope = 0;
+
+  Serial.println("MPU klaar.");
+}
+
+
+// ---------------- SETUP ----------------
+
+void setup() {
+
+  Serial.begin(115200);
+
+  Wire.begin();
+
+  pinMode(
+    powerButtonPin,
+    INPUT_PULLUP
+  );
+
+
+  rawButtonState =
+    digitalRead(powerButtonPin);
+
+  stableButtonState =
+    rawButtonState;
+
+  lastButtonChangeTime =
+    millis();
+
+
+  mpuReady =
+    writeMPU(0x6B, 0x00);
+
+
+  if (!mpuReady) {
+
+    Serial.println("MPU6050 niet gevonden.");
+
+  } else {
+
+    writeMPU(0x1B, 0x00);
+    writeMPU(0x1C, 0x00);
+
+    calibrateMPU();
+  }
+
+
+  previousMicros = micros();
+
+  filteredFlex1 = flex1Straight;
+  filteredFlex2 = flex2Straight;
+
+
+  Serial.println();
+  Serial.println("Pro Micro MIDI glove klaar.");
+  Serial.println("Knop = handschoen aan/uit");
+  Serial.println("reset = waarden resetten");
+  Serial.println("c = flex kalibreren");
+  Serial.println("0 = alle CC's");
+  Serial.println();
+}
+
+
+// ---------------- LOOP ----------------
+
+void loop() {
+
+  handleSerialCommands();
+
+  updatePowerButton();
+
+
+  if (!gloveEnabled) {
+
+    previousMicros = micros();
+
+    delay(20);
+
+    return;
+  }
+
+
+  if (!mpuReady) {
+
+    if (
+      millis() - lastErrorPrint >=
+      1000
+    ) {
+
+      lastErrorPrint = millis();
+
+      Serial.println(
+        "MPU6050 niet beschikbaar."
+      );
+    }
+
+    return;
+  }
+
+
+  int16_t ax, ay, az;
+  int16_t gx, gy, gz;
+
+
+  if (!readMPU(
+    ax, ay, az,
+    gx, gy, gz
+  )) {
+
+    Serial.println("MPU leesfout");
+
+    delay(100);
+
+    return;
+  }
+
+
+  unsigned long now = micros();
+
+  float deltaTime =
+    (now - previousMicros)
+    / 1000000.0;
+
+  previousMicros = now;
+
+
+  float axG = ax / 16384.0;
+  float ayG = ay / 16384.0;
+  float azG = az / 16384.0;
+
+
+  float accelAngleX =
+    atan2(ayG, azG)
+    * 180.0 / PI;
+
+
+  float accelAngleY =
+    atan2(
+      -axG,
+      sqrt(
+        ayG * ayG +
+        azG * azG
+      )
+    )
+    * 180.0 / PI;
+
+
+  float gyroRateX =
+    (gx - gyroOffsetX)
+    / 131.0;
+
+
+  float gyroRateY =
+    (gy - gyroOffsetY)
+    / 131.0;
+
+
+  float gyroRateZ =
+    (gz - gyroOffsetZ)
+    / 131.0;
+
+
+  angleX =
+    0.95 *
+    (angleX + gyroRateX * deltaTime)
+    +
+    0.05 * accelAngleX;
+
+
+  angleY =
+    0.95 *
+    (angleY + gyroRateY * deltaTime)
+    +
+    0.05 * accelAngleY;
+
+
+  float relativeX =
+    angleX - neutralAngleX;
+
+
+  float relativeY =
+    angleY - neutralAngleY;
+
+
+  int valueCC90 =
+    relativeX > 0
+      ? angleToMidi(
+          relativeX,
+          maxTiltDegrees
+        )
+      : 0;
+
+
+  int valueCC91 =
+    relativeX < 0
+      ? angleToMidi(
+          -relativeX,
+          maxTiltDegrees
+        )
+      : 0;
+
+
+  int valueCC92 =
+    relativeY > 0
+      ? angleToMidi(
+          relativeY,
+          maxTiltDegrees
+        )
+      : 0;
+
+
+  int valueCC93 =
+    relativeY < 0
+      ? angleToMidi(
+          -relativeY,
+          maxTiltDegrees
+        )
+      : 0;
+
+
+  angleZ +=
+    gyroRateZ * deltaTime;
+
+
+  angleZ =
+    constrain(
+      angleZ,
+      -maxZAngleDegrees,
+      maxZAngleDegrees
+    );
+
+
+  int valueCC94 =
+    angleZ > 0
+      ? angleToMidi(
+          angleZ,
+          maxZAngleDegrees
+        )
+      : 0;
+
+
+  int valueCC95 =
+    angleZ < 0
+      ? angleToMidi(
+          -angleZ,
+          maxZAngleDegrees
+        )
+      : 0;
+
+
+  gravityX =
+    0.985 * gravityX +
+    0.015 * axG;
+
+  gravityY =
+    0.985 * gravityY +
+    0.015 * ayG;
+
+  gravityZ =
+    0.985 * gravityZ +
+    0.015 * azG;
+
+
+  float linearX =
+    axG - gravityX;
+
+  float linearY =
+    ayG - gravityY;
+
+  float linearZ =
+    azG - gravityZ;
+
+
+  float motionG =
+    sqrt(
+      linearX * linearX +
+      linearY * linearY +
+      linearZ * linearZ
+    );
+
+
+  int targetMotionMidi =
+    motionToMidi(motionG);
+
+
+  if (
+    targetMotionMidi >
+    motionEnvelope
+  ) {
+
+    motionEnvelope =
+      targetMotionMidi;
+
+  } else {
+
+    float releaseStep =
+      127.0 *
+      deltaTime /
+      motionReleaseSeconds;
+
+    motionEnvelope -=
+      releaseStep;
+
+    if (
+      motionEnvelope <
+      targetMotionMidi
+    ) {
+
+      motionEnvelope =
+        targetMotionMidi;
+    }
+  }
+
+
+  motionEnvelope =
+    constrain(
+      motionEnvelope,
+      0.0,
+      127.0
+    );
+
+
+  int valueCC96 =
+    (int)(
+      motionEnvelope + 0.5
+    );
+
+
+  int rawFlex1;
+  int rawFlex2;
+
+  int midiFlex1;
+  int midiFlex2;
+
+
+  int valueCC97 =
+    updateFlexSensors(
+      rawFlex1,
+      rawFlex2,
+      midiFlex1,
+      midiFlex2
+    );
+
+
+  sendCCIfAllowed(
+    ccXPositive,
+    valueCC90,
+    previousCC90
+  );
+
+  sendCCIfAllowed(
+    ccXNegative,
+    valueCC91,
+    previousCC91
+  );
+
+  sendCCIfAllowed(
+    ccYPositive,
+    valueCC92,
+    previousCC92
+  );
+
+  sendCCIfAllowed(
+    ccYNegative,
+    valueCC93,
+    previousCC93
+  );
+
+  sendCCIfAllowed(
+    ccZPositive,
+    valueCC94,
+    previousCC94
+  );
+
+  sendCCIfAllowed(
+    ccZNegative,
+    valueCC95,
+    previousCC95
+  );
+
+  sendCCIfAllowed(
+    ccMotion,
+    valueCC96,
+    previousCC96
+  );
+
+  sendCCIfAllowed(
+    ccFlex,
+    valueCC97,
+    previousCC97
+  );
+
+
+  MidiUSB.flush();
+
+
+  if (
+    millis() - lastPrintTime >=
+    100
+  ) {
+
+    lastPrintTime = millis();
+
+    Serial.print("X:");
+    Serial.print(relativeX, 1);
+
+    Serial.print(" [");
+    Serial.print(valueCC90);
+    Serial.print(",");
+    Serial.print(valueCC91);
+    Serial.print("]  ");
+
+    Serial.print("Y:");
+    Serial.print(relativeY, 1);
+
+    Serial.print(" [");
+    Serial.print(valueCC92);
+    Serial.print(",");
+    Serial.print(valueCC93);
+    Serial.print("]  ");
+
+    Serial.print("Z:");
+    Serial.print(angleZ, 1);
+
+    Serial.print(" [");
+    Serial.print(valueCC94);
+    Serial.print(",");
+    Serial.print(valueCC95);
+    Serial.print("]  ");
+
+    Serial.print("Motion:");
+    Serial.print(valueCC96);
+
+    Serial.print("  Flex:");
+    Serial.print(valueCC97);
+
+    Serial.print(" [F1:");
+    Serial.print(midiFlex1);
+
+    Serial.print(" F2:");
+    Serial.print(midiFlex2);
+
+    Serial.print("] RAW:");
+
+    Serial.print(rawFlex1);
+    Serial.print(",");
+    Serial.println(rawFlex2);
+  }
+
+
+  delay(5);
+}
